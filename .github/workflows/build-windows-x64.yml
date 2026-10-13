@@ -68,7 +68,13 @@ jobs:
           key: win-x64-deps-${{ hashFiles('**/Telegram/build/prepare/prepare.py') }}
           restore-keys: |
             win-x64-deps-
-
+            
+      - name: Fix MSYS2 diffutils package name
+        shell: bash
+        run: |
+          cd $TBUILD/$REPO_NAME
+          echo "Fixing diffutils package name in prepare scripts..."
+          find Telegram/build/prepare -type f -exec sed -i 's/mingw-w64-x86_64-diffutils/diffutils/g' {} +
       # 6. 下载并准备第三方依赖库
       - name: Prepare Libraries
         run: |
