@@ -1,0 +1,112 @@
+name: Build AyuGram Windows x64 (Speed Boost)
+
+on:
+  workflow_dispatch: # 支持网页端手动一键触发构建
+  push:
+    branches: [ master, dev, main ]
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+
+jobs:
+  build-win64:
+    name: Build AyuGram x86-64 Release
+    runs-on: windows-latest
+    timeout-minutes: 300
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      # 1. 映射构建目录以符合 TDesktop 目录层次规范
+      - name: Prepare build directories
+        run: |
+          mkdir %userprofile%\TBuild\Libraries
+          mklink /d %GITHUB_WORKSPACE%\TBuild %userprofile%\TBuild
+          echo TBUILD=%GITHUB_WORKSPACE%\TBuild>>%GITHUB_ENV%
+          echo LibrariesPath=%GITHUB_WORKSPACE%\TBuild\Libraries\win64>>%GITHUB_ENV%
+
+      - name: Export repository name
+        shell: bash
+        run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
+
+      # 2. 递归拉取 AyuGram 源码及其 Submodules
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
+
+      # 3. 自动应用 64Gram 1.1.53 下载加速特性（提升线程与分块管道）
+      - name: Apply 64Gram 1.1.53 Download Speed Boost
+        shell: bash
+        run: |
+          cd $TBUILD/$REPO_NAME
+          echo "Patching download thread limits and pipeline buffers..."
+          
+          # 遍历源码查找下载并发限制并从默认 4 提升为 8（64Gram 1.1.53 标准值）
+          find Telegram/SourceFiles -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i \
+            -e 's/constexpr auto kMaxDownloadThreads = 4;/constexpr auto kMaxDownloadThreads = 8;/g' \
+            -e 's/constexpr auto kMaxThreads = 4;/constexpr auto kMaxThreads = 8;/g' \
+            -e 's/constexpr auto kMaxPipelinedChunks = 4;/constexpr auto kMaxPipelinedChunks = 8;/g' {} +
+
+      # 4. 配置 MSVC 编译工具链 (VS2022 / v144 工具集)
+      - name: Setup MSVC Developer Environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+          toolset: 14.44
+
+      # 5. 缓存依赖库以加速后续构建
+      - name: Cache Libraries & Dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ${{ env.TBUILD }}\ThirdParty
+            ${{ env.LibrariesPath }}
+          key: win-x64-deps-${{ hashFiles('**/Telegram/build/prepare/prepare.py') }}
+          restore-keys: |
+            win-x64-deps-
+
+      # 6. 下载并准备第三方依赖库
+      - name: Prepare Libraries
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
+
+      # 7. 清理临时编译缓存释放磁盘空间（防止 Actions 磁盘写满）
+      - name: Cleanup temporary library files
+        shell: bash
+        run: |
+          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' ')' -type f ')' -o -empty ')' -delete
+
+      # 8. 执行项目工程配置
+      - name: Configure CMake
+        run: |
+          cd %TBUILD%\%REPO_NAME%\Telegram
+          call configure.bat x64 -D TDESKTOP_API_TEST=ON -D CMAKE_CONFIGURATION_TYPES=Release
+
+      # 9. 多核并行编译 Release 二进制文件
+      - name: Compile AyuGram
+        run: |
+          cd %TBUILD%\%REPO_NAME%
+          cmake --build out --config Release --target Telegram --parallel
+
+      # 10. 收集二进制产物并打包
+      - name: Package Release
+        shell: bash
+        run: |
+          OUT_DIR="$TBUILD/$REPO_NAME/out/Release"
+          mkdir -p release_artifact
+          cp "$OUT_DIR/Telegram.exe" release_artifact/AyuGram.exe
+          if [ -f "$OUT_DIR/Updater.exe" ]; then
+            cp "$OUT_DIR/Updater.exe" release_artifact/Updater.exe
+          fi
+
+      # 11. 上传编译产物至 Actions Artifacts
+      - name: Upload Build Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AyuGram-Win64-SpeedBoost
+          path: release_artifact/
+          retention-days: 14
