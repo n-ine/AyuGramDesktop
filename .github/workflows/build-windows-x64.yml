@@ -69,12 +69,15 @@ jobs:
           restore-keys: |
             win-x64-deps-
             
-      - name: Fix MSYS2 diffutils package name
+      - name: Fix MSYS2 diffutils & GitLab 503 Mirror URLs
         shell: bash
         run: |
           cd $TBUILD/$REPO_NAME
           echo "Fixing diffutils package name in prepare scripts..."
           find Telegram/build/prepare -type f -exec sed -i 's/mingw-w64-x86_64-diffutils/diffutils/g' {} +
+
+          echo "Configuring Git insteadOf to bypass GitLab 503 error for libyuv..."
+          git config --global url."https://chromium.googlesource.com/libyuv/libyuv".insteadOf "https://gitlab.com/chromiumsrc/libyuv"
       # 6. 下载并准备第三方依赖库
       - name: Prepare Libraries
         run: |
