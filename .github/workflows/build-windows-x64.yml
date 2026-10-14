@@ -1,7 +1,7 @@
 name: Build AyuGram Windows x64 (Speed Boost)
 
 on:
-  workflow_dispatch: # 支持网页端手动一键触发构建
+  workflow_dispatch:
   push:
     branches: [ master, dev, main ]
     paths-ignore:
@@ -12,14 +12,17 @@ jobs:
   build-win64:
     name: Build AyuGram x86-64 Release
     runs-on: windows-latest
-    timeout-minutes: 300
+    timeout-minutes: 360
+
+    env:
+      PREPARE_PATH: "Telegram/build/prepare/prepare.py"
 
     defaults:
       run:
         shell: cmd
 
     steps:
-      # 1. 映射构建目录以符合 TDesktop 目录层次规范
+      # 1. 创建并映射构建目录以符合 TDesktop 规范
       - name: Prepare build directories
         run: |
           mkdir %userprofile%\TBuild\Libraries
@@ -31,91 +34,138 @@ jobs:
         shell: bash
         run: echo "REPO_NAME=${GITHUB_REPOSITORY##*/}" >> $GITHUB_ENV
 
-      # 2. 递归拉取 AyuGram 源码及其 Submodules
+      # 2. 递归拉取 AyuGram 源码及所有子模块
       - name: Checkout Source Code
         uses: actions/checkout@v4
         with:
           submodules: recursive
           path: ${{ env.TBUILD }}\${{ env.REPO_NAME }}
 
-      # 3. 自动应用 64Gram 1.1.53 下载加速特性（提升线程与分块管道）
+      # 3. 初始化环境参数、修复 diffutils 包名与 GitLab 503 镜像问题
+      - name: Environment Setup & Build Script Fixes
+        shell: bash
+        run: |
+          cd "$TBUILD/$REPO_NAME"
+
+          # 提取文档要求的 Windows SDK 版本号
+          DOCPATH="$TBUILD/$REPO_NAME/docs/building-win.md"
+          SDK="$(grep "SDK version" "$DOCPATH" | sed -r 's/.*\*\*(.*)\*\* SDK version.*/\1/')"
+          echo "SDK=$SDK" >> $GITHUB_ENV
+
+          # 生成缓存唯一哈希 Key
+          echo "$(sha256sum "$TBUILD/$REPO_NAME/$PREPARE_PATH" | awk '{ print $1 }')" >> CACHE_KEY.txt
+          echo "$SDK" >> CACHE_KEY.txt
+          echo "CACHE_KEY=$(sha256sum CACHE_KEY.txt | awk '{ print $1 }')" >> $GITHUB_ENV
+
+          # 配置 Git 用户信息（供 prepare 脚本内打补丁使用）
+          git config --global user.email "builder@localhost"
+          git config --global user.name "CI Builder"
+
+          # 【修复 1】修正 MSYS2 diffutils 包名错误
+          echo "Fixing mingw-w64-x86_64-diffutils -> diffutils..."
+          find Telegram/build/prepare -type f -exec sed -i 's/mingw-w64-x86_64-diffutils/diffutils/g' {} +
+
+          # 【修复 2】将 GitLab 上的 libyuv 重定向至 Google 官方源，解决 503 错误
+          echo "Redirecting libyuv from GitLab to GoogleSource..."
+          git config --global url."https://chromium.googlesource.com/libyuv/libyuv".insteadOf "https://gitlab.com/chromiumsrc/libyuv"
+
+      # 4. 注入 64Gram 1.1.53 下载加速特性（提升并发下载线程与分块队列）
       - name: Apply 64Gram 1.1.53 Download Speed Boost
         shell: bash
         run: |
-          cd $TBUILD/$REPO_NAME
-          echo "Patching download thread limits and pipeline buffers..."
-          
-          # 遍历源码查找下载并发限制并从默认 4 提升为 8（64Gram 1.1.53 标准值）
+          cd "$TBUILD/$REPO_NAME"
+          echo "Applying 64Gram 1.1.53 download speed boost..."
           find Telegram/SourceFiles -type f \( -name "*.cpp" -o -name "*.h" \) -exec sed -i \
             -e 's/constexpr auto kMaxDownloadThreads = 4;/constexpr auto kMaxDownloadThreads = 8;/g' \
             -e 's/constexpr auto kMaxThreads = 4;/constexpr auto kMaxThreads = 8;/g' \
             -e 's/constexpr auto kMaxPipelinedChunks = 4;/constexpr auto kMaxPipelinedChunks = 8;/g' {} +
 
-      # 4. 配置 MSVC 编译工具链 (VS2022 / v144 工具集)
+      # 5. 配置 MSVC x64 编译环境
       - name: Setup MSVC Developer Environment
         uses: ilammy/msvc-dev-cmd@v1
         with:
           arch: x64
+          sdk: ${{ env.SDK }}
           toolset: 14.44
 
-      # 5. 缓存依赖库以加速后续构建
-      - name: Cache Libraries & Dependencies
+      - name: Configure NuGet sources
+        run: |
+          nuget sources Disable -Name "Microsoft Visual Studio Offline Packages"
+          nuget sources Add -Source https://api.nuget.org/v3/index.json & exit 0
+
+      # 6. 分层缓存第三方工具与 Release 依赖库（使用 v2-release 隔离旧缓存）
+      - name: Cache ThirdParty Tools
         uses: actions/cache@v4
         with:
-          path: |
-            ${{ env.TBUILD }}\ThirdParty
-            ${{ env.LibrariesPath }}
-          key: win-x64-deps-${{ hashFiles('**/Telegram/build/prepare/prepare.py') }}
+          path: ${{ env.TBUILD }}\ThirdParty
+          key: win-x64-thirdparty-v2-release-${{ env.CACHE_KEY }}
           restore-keys: |
-            win-x64-deps-
-            
-      - name: Fix MSYS2 diffutils & GitLab 503 Mirror URLs
+            win-x64-thirdparty-v2-release-
+
+      - name: Cache Libraries (Release)
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.LibrariesPath }}
+          key: win-x64-libs-v2-release-${{ env.CACHE_KEY }}
+          restore-keys: |
+            win-x64-libs-v2-release-
+
+      # 7. 编译第三方依赖库（不带 skip-release，确保生成 Release 版静态库如 avif.lib）
+      - name: Prepare Libraries (Release)
+        run: |
+          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat silent
+
+      # 8. 清理中间编译文件释放磁盘空间（保留 .lib、头文件和 cache_keys）
+      - name: Free up disk space
         shell: bash
         run: |
-          cd $TBUILD/$REPO_NAME
-          echo "Fixing diffutils package name in prepare scripts..."
-          find Telegram/build/prepare -type f -exec sed -i 's/mingw-w64-x86_64-diffutils/diffutils/g' {} +
+          find "$LibrariesPath" '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' -o -path '*/cache_keys/*' -o -path '*/patches/*' -o -path '*/nv-codec-headers/*' ')' -type f ')' -o -empty ')' -delete
 
-          echo "Configuring Git insteadOf to bypass GitLab 503 error for libyuv..."
-          git config --global url."https://chromium.googlesource.com/libyuv/libyuv".insteadOf "https://gitlab.com/chromiumsrc/libyuv"
-      # 6. 下载并准备第三方依赖库
-      - name: Prepare Libraries
-        run: |
-          %TBUILD%\%REPO_NAME%\Telegram\build\prepare\win.bat skip-release silent
-
-      # 7. 清理临时编译缓存释放磁盘空间（防止 Actions 磁盘写满）
-      - name: Cleanup temporary library files
-        shell: bash
-        run: |
-          find $LibrariesPath '(' '(' ! '(' -name '*.lib' -o -name '*.a' -o -name '*.exe' -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cmake' -o -name '*.pc' -o -path '*/include/*' -o -path '*/objects-*' ')' -type f ')' -o -empty ')' -delete
-
-      # 8. 执行项目工程配置
-      - name: Configure CMake
+      # 9. 配置 CMake（使用正式环境 API 凭据并关闭自动更新）
+      - name: Configure AyuGram CMake
+        env:
+          API_ID: ${{ secrets.TELEGRAM_API_ID || '611335' }}
+          API_HASH: ${{ secrets.TELEGRAM_API_HASH || 'd524b414d21f4d37f08684c1df41ac9c' }}
         run: |
           cd %TBUILD%\%REPO_NAME%\Telegram
-          call configure.bat x64 -D TDESKTOP_API_TEST=ON -D CMAKE_CONFIGURATION_TYPES=Release
+          call configure.bat x64 ^
+            -D TDESKTOP_API_ID=%API_ID% ^
+            -D TDESKTOP_API_HASH=%API_HASH% ^
+            -D CMAKE_CONFIGURATION_TYPES=Release ^
+            -D DESKTOP_APP_DISABLE_AUTOUPDATE=ON ^
+            -D DESKTOP_APP_DISABLE_CRASH_REPORTS=ON
 
-      # 9. 多核并行编译 Release 二进制文件
-      - name: Compile AyuGram
+      # 10. 多核并行编译 Release 主程序
+      - name: Compile AyuGram Release
         run: |
           cd %TBUILD%\%REPO_NAME%
-          cmake --build out --config Release --target Telegram --parallel
+          cmake --build out --config Release --parallel
 
-      # 10. 收集二进制产物并打包
-      - name: Package Release
+      # 11. 收集并整理构建产物（自动兼容 AyuGram.exe / Telegram.exe 命名）
+      - name: Package Release Artifact
         shell: bash
         run: |
           OUT_DIR="$TBUILD/$REPO_NAME/out/Release"
           mkdir -p release_artifact
-          cp "$OUT_DIR/Telegram.exe" release_artifact/AyuGram.exe
+
+          if [ -f "$OUT_DIR/AyuGram.exe" ]; then
+            cp "$OUT_DIR/AyuGram.exe" release_artifact/AyuGram.exe
+          elif [ -f "$OUT_DIR/Telegram.exe" ]; then
+            cp "$OUT_DIR/Telegram.exe" release_artifact/AyuGram.exe
+          else
+            echo "Executable not found in $OUT_DIR, listing files:"
+            ls -la "$OUT_DIR"
+            exit 1
+          fi
+
           if [ -f "$OUT_DIR/Updater.exe" ]; then
             cp "$OUT_DIR/Updater.exe" release_artifact/Updater.exe
           fi
 
-      # 11. 上传编译产物至 Actions Artifacts
-      - name: Upload Build Artifact
+      # 12. 上传最终可执行程序包至 GitHub Actions Artifacts
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: AyuGram-Win64-SpeedBoost
+          name: AyuGram-Win64-SpeedBoost-Release
           path: release_artifact/
-          retention-days: 14
+          retention-days: 30
